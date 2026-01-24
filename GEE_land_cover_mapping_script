@@ -1,0 +1,175 @@
+Google Earth Engine LULC classification script with sentinel data
+
+var classes = ee.FeatureCollection("projects/my-project-lc-projection/assets/CAR_LC_points"),
+    polygon = ee.FeatureCollection("users/ginathyuh/CAR_boundaries");
+
+// -----------------------------
+// Define study area
+// -----------------------------
+// -----------------------------
+// Cloud + shadow + snow masking
+// -----------------------------
+function maskS2_SR(image) {
+  var scl = image.select('SCL');
+  var sclMask = scl.neq(3)   // cloud shadow
+                  .and(scl.neq(8))   // medium cloud
+                  .and(scl.neq(9))   // high cloud
+                  .and(scl.neq(10))  // cirrus
+                  .and(scl.neq(11)); // snow/ice
+
+  // Very strict cloud probability
+  var prob = image.select('MSK_CLDPRB');
+  var probMask = prob.lt(1);
+
+  var mask = sclMask.and(probMask);
+
+  // Select bands + scale
+  var scaled = image.select(['B2','B3','B4','B8','B11'])
+                    .divide(10000);
+
+  // Indices
+  var ndvi = scaled.normalizedDifference(['B8','B4']).rename('NDVI');
+  var ndwi = scaled.normalizedDifference(['B3','B8']).rename('NDWI');
+  var ndbi = scaled.normalizedDifference(['B11','B8']).rename('NDBI');
+
+  return scaled.addBands([ndvi, ndwi, ndbi])
+               .updateMask(mask)
+               .copyProperties(image, ['system:time_start']);
+}
+
+// -----------------------------
+// Strict composite
+// -----------------------------
+var s2_strict = ee.ImageCollection('COPERNICUS/S2_SR')
+                  .filterDate('2023-01-01', '2025-12-31')
+                  .filterBounds(polygon)
+                  .map(maskS2_SR);
+
+var strictComposite = s2_strict.qualityMosaic('NDVI').clip(polygon);
+
+// -----------------------------
+// Loose composite (with same bands)
+// -----------------------------
+function looseMask(image) {
+  var scaled = image.select(['B2','B3','B4','B8','B11'])
+                    .divide(10000);
+  var ndvi = scaled.normalizedDifference(['B8','B4']).rename('NDVI');
+  var ndwi = scaled.normalizedDifference(['B3','B8']).rename('NDWI');
+  var ndbi = scaled.normalizedDifference(['B11','B8']).rename('NDBI');
+  return scaled.addBands([ndvi, ndwi, ndbi])
+               .copyProperties(image, ['system:time_start']);
+}
+
+var looseComposite = ee.ImageCollection('COPERNICUS/S2_SR')
+                        .filterDate('2023-01-01', '2025-12-31')
+                        .filterBounds(polygon)
+                        .map(looseMask)
+                        .median()
+                        .clip(polygon);
+
+// -----------------------------
+// Gap-filled composite
+// -----------------------------
+var gapFilled = strictComposite.unmask(looseComposite);
+
+// Optional: spatial interpolation for small gaps
+gapFilled = gapFilled.unmask(
+              gapFilled.focal_mean(250, 'circle', 'meters')
+            );
+
+// -----------------------------
+// Night-time lights
+// -----------------------------
+var viirs = ee.ImageCollection('NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG')
+              .select('avg_rad')
+              .filterDate('2023-01-01', '2025-12-31')
+              .filterBounds(polygon)
+              .median()
+              .clip(polygon);
+
+// -----------------------------
+// Final composite (S2 + indices + VIIRS)
+// -----------------------------
+var finalComposite = gapFilled.addBands(viirs.rename('NightLights'));
+
+print('Final Composite', finalComposite);
+
+// -----------------------------
+// Visualization
+// -----------------------------
+Map.centerObject(polygon, 10);
+
+Map.addLayer(finalComposite, {bands:['B4','B3','B2'], min:0, max:0.3, gamma:1.5}, 'S2 Composite (True Color)');
+Map.addLayer(finalComposite.select('NDVI'), {min:0, max:1, palette:['brown','yellow','green']}, 'NDVI');
+Map.addLayer(finalComposite.select('NDWI'), {min:-1, max:1, palette:['brown','white','blue']}, 'NDWI');
+Map.addLayer(finalComposite.select('NDBI'), {min:-1, max:1, palette:['green','yellow','red']}, 'NDBI');
+Map.addLayer(finalComposite.select('NightLights'), {min:0, max:60, palette:['black','purple','blue','cyan','yellow','red']}, 'NightLights');
+
+
+// Land cover classification and accuracy assessment
+var classNames= classes;
+print(classNames);
+
+// Adding a random column and splitting training points into test and validation data
+var gcp = classNames.randomColumn();
+
+// Splitting datasets as 80% for test and 20% for validation
+var trainingGcp = gcp.filter(ee.Filter.lt('random', 0.8));
+var validationGcp = gcp.filter(ee.Filter.gte('random', 0.2));
+
+// Next is to overlay the points on the normalized image in order to sample band pixel points.
+var training = finalComposite.sampleRegions({
+  collection: trainingGcp,
+  properties: ['value'],
+  scale: 10,
+  tileScale: 16
+});
+print(training);
+
+var classifier = ee.Classifier.smileRandomForest(50).train({
+  features: training,  
+  classProperty: 'value', 
+  inputProperties: finalComposite.bandNames()
+});
+
+// Classify the image
+var classified = finalComposite.classify(classifier);
+Map.addLayer(classified, {min: 0, max: 30, palette: ['gray', 'brown', 'blue', 'green', 'red', 'black', 'yellow', 'pink']}, 'LC2025');
+print(classified);
+
+// Accuracy assessment
+var test = classified.sampleRegions({
+  collection: validationGcp,
+  properties: ['value'],
+  tileScale: 16,
+  scale: 10,
+});
+
+var testConfusionMatrix = test.errorMatrix('value', 'classification');
+print('Confusion Matrix', testConfusionMatrix);
+print('Test Accuracy', testConfusionMatrix.accuracy());
+
+var fc = ee.FeatureCollection([
+  ee.Feature(null, {
+    'accuracy': testConfusionMatrix.accuracy(),
+    'matrix': testConfusionMatrix.array()
+  })
+]);
+print(fc);
+
+Export.table.toDrive({
+  collection: fc,
+  description: 'Accuracy_Export',
+  folder: 'CAR_LULC_2025',
+  fileNamePrefix: 'accuracy2025',
+  fileFormat: 'CSV'
+});
+
+Export.image.toDrive({
+  image: classified,
+  description: 'LC2025_classified',
+  folder: 'CAR_LULC_2025',
+  scale: 10,
+  region: polygon,
+  maxPixels: 1e13
+});
